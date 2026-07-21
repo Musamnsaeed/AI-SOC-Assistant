@@ -2,6 +2,7 @@ import os
 import time
 import pandas as pd
 import streamlit as st
+from threat_intel import check_abuseipdb, check_virustotal
 
 st.set_page_config(page_title="AI Suricata SOC Dashboard", layout="wide")
 
@@ -13,9 +14,9 @@ csv_file = "alert_history.csv"
 # Safe File Load with Error Handling
 if os.path.exists(csv_file) and os.path.getsize(csv_file) > 0:
     try:
-        df = pd.read_csv(csv_file)
+        df = pd.read_csv(csv_file, on_bad_lines='skip')
     except Exception as e:
-        st.warning("Reading live stream... Standby.")
+        st.warning(f"Reading live stream... Standby. ({e})")
         df = pd.DataFrame()
 else:
     df = pd.DataFrame()
@@ -60,6 +61,49 @@ if not df.empty:
                 st.info("No MITRE techniques mapped yet.")
         else:
             st.info("MITRE ID column not detected.")
+
+    st.markdown("---")
+    st.subheader("🔍 Threat Intelligence Lookup")
+    
+    col_input, col_btn = st.columns([3, 1])
+    with col_input:
+        selected_ip = st.text_input("Enter IP Address to Check Threat Intel:", value="118.25.6.39")
+    with col_btn:
+        st.write("") # vertical spacing
+        st.write("")
+        check_btn = st.button("Check IP Reputation", use_container_width=True)
+
+    if check_btn or ("threat_intel_ip" in st.session_state and st.session_state["threat_intel_ip"] == selected_ip):
+        if check_btn:
+            with st.spinner(f"Querying AbuseIPDB & VirusTotal for {selected_ip}..."):
+                abuse_res = check_abuseipdb(selected_ip)
+                vt_res = check_virustotal(selected_ip)
+                st.session_state["threat_intel_ip"] = selected_ip
+                st.session_state["threat_intel_data"] = (abuse_res, vt_res)
+        
+        if "threat_intel_data" in st.session_state:
+            abuse_res, vt_res = st.session_state["threat_intel_data"]
+            
+            if not abuse_res.get("is_public", True):
+                st.info(f"ℹ️ **{selected_ip}** is a **Private / Internal IP address**. Threat intelligence databases (AbuseIPDB & VirusTotal) only index public Internet IPs.")
+            else:
+                col1, col2 = st.columns(2)
+
+                with col1:
+                    st.metric(
+                        label="AbuseIPDB Confidence Score",
+                        value=f"{abuse_res['abuse_score']}%",
+                        delta="High Risk" if abuse_res['abuse_score'] > 50 else "Clean / Low Risk"
+                    )
+                    st.write(f"Total Reports: **{abuse_res['total_reports']}** | Status: **{abuse_res.get('status', 'OK')}**")
+
+                with col2:
+                    st.metric(
+                        label="VirusTotal Malicious Detections",
+                        value=f"{vt_res['malicious_votes']} Vendors",
+                        delta="Flagged" if vt_res['malicious_votes'] > 0 else "Clean"
+                    )
+                    st.write(f"Status: **{vt_res.get('status', 'OK')}**")
 else:
     st.info("⏳ Awaiting alert stream from Suricata IDS... (Run `suricata_ai_agent.py` to populate data)")
 
