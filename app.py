@@ -55,12 +55,16 @@ if not df.empty:
             # Filter out N/A or empty values
             filtered_mitre = df[~df[mitre_col].astype(str).isin(['N/A', 'None', 'nan', ''])]
             if not filtered_mitre.empty:
-                mitre_counts = filtered_mitre[mitre_col].value_counts()
-                st.bar_chart(mitre_counts)
+                # Value counts calculate karein
+                mitre_counts = filtered_mitre[mitre_col].value_counts().reset_index()
+                mitre_counts.columns = ["MITRE ID", "Count"]
+
+                # Streamlit Bar Chart render karein
+                st.bar_chart(data=mitre_counts, x="MITRE ID", y="Count")
             else:
                 st.info("No MITRE techniques mapped yet.")
         else:
-            st.info("MITRE ID column not detected.")
+            st.warning("No MITRE ID data available to plot.")
 
     st.markdown("---")
     st.subheader("🔍 Threat Intelligence Lookup")

@@ -4,6 +4,7 @@ import csv
 import os
 import time
 from threat_intel import check_abuseipdb, check_virustotal
+from rag_mitre import retrieve_mitre_context
 
 # Target the installed Suricata log path on Windows if it exists, otherwise fall back to local eve.json
 DEFAULT_SURI_PATH = r"C:\Program Files\Suricata\log\eve.json"
@@ -16,27 +17,44 @@ CSV_DATABASE = "alert_history.csv"
 OLLAMA_URL = "http://localhost:11434/api/generate"
 
 def query_llama_mitre(alert_data, abuse_data=None, vt_data=None):
+    # Retrieve Ground-Truth MITRE Context via FAISS RAG
+    mitre_context = retrieve_mitre_context(alert_data.get('signature', ''))
+    
+    # Format Threat Intelligence Info
     abuse_score = abuse_data.get("abuse_score", 0) if abuse_data else 0
     vt_malicious = vt_data.get("malicious_votes", 0) if vt_data else 0
-
-    # Enterprise-grade SOC Analyst prompt with MITRE ATT&CK Mapping & Threat Intel Context
+    threat_intel_context = (
+        f"- AbuseIPDB Confidence Score: {abuse_score}%\n"
+        f"- VirusTotal Malicious Detections: {vt_malicious} vendors"
+    )
+    
+    # RAG-Grounded SOC Analyst Prompt
     prompt = f"""
-    You are an expert Tier-2 SOC Analyst. Analyze this Suricata Network IDS alert:
+    You are an expert Tier-2 SOC Analyst. Analyze this Suricata Network IDS alert.
+    
+    ALERT DATA:
     - Signature/Rule: {alert_data.get('signature')}
     - Category: {alert_data.get('category')}
-    - Source IP: {alert_data.get('src_ip')}:{alert_data.get('src_port')} (AbuseIPDB Score: {abuse_score}%, VirusTotal Malicious: {vt_malicious})
+    - Source IP: {alert_data.get('src_ip')}:{alert_data.get('src_port')}
     - Destination IP: {alert_data.get('dest_ip')}:{alert_data.get('dest_port')}
     - Protocol: {alert_data.get('proto')}
     - Raw Severity Level: {alert_data.get('raw_severity')}
 
-    Analyze this threat and map it to MITRE ATT&CK framework.
+    THREAT INTELLIGENCE FEEDBACK:
+    {threat_intel_context}
+
+    RETRIEVED MITRE ATT&CK GROUND TRUTH KNOWLEDGE:
+    {mitre_context}
+
+    INSTRUCTIONS:
+    Analyze this threat using ONLY the provided Ground Truth Knowledge where applicable.
     Return ONLY a single valid JSON object with NO extra text or markdown codeblocks using this schema:
     {{
         "verdict": "Threat" or "Normal",
         "severity": "Low" or "Medium" or "High" or "Critical",
         "mitre_id": "e.g. T1110 or T1595 or N/A",
         "action_required": "Yes" or "No",
-        "summary": "Short 1-sentence technical explanation"
+        "summary": "Short 1-sentence technical explanation incorporating official mitigations"
     }}
     """
     
