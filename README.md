@@ -1,0 +1,1 @@
+![AI SOC Analyst Dashboard Architecture](./architecture_banner.png)
