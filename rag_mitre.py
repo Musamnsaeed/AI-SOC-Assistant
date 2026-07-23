@@ -1,15 +1,63 @@
 import os
-import json
 import requests
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_core.documents import Document
 
+# Robust imports for Hybrid Search
+try:
+    from langchain.retrievers import EnsembleRetriever          # main package
+except ImportError:
+    try:
+        from langchain_community.retrievers import EnsembleRetriever  # older versions
+    except ImportError:
+        EnsembleRetriever = None
+
+try:
+    from langchain_community.retrievers import BM25Retriever
+except ImportError:
+    try:
+        # pyrefly: ignore [missing-import]
+        from langchain.retrievers import BM25Retriever
+    except ImportError:
+        BM25Retriever = None
+
 VECTOR_DB_PATH = "faiss_mitre_index"
 STIX_URL = "https://raw.githubusercontent.com/mitre/cti/master/enterprise-attack/enterprise-attack.json"
 
-print("[*] Initializing Embedding Model (all-MiniLM-L6-v2)...")
-embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+print("[*] Initializing Embedding Model (all-mpnet-base-v2)...")
+embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-mpnet-base-v2")
+
+# ── Keyword Enrichment: inject real-world attack aliases into specific chunks ──
+# Keys = MITRE External ID, Values = extra keywords added to the chunk text.
+# Add more entries here as needed without rebuilding the whole pipeline.
+KEYWORD_ENRICHMENT = {
+    # Web exploitation
+    "T1190": "sql injection sqli xss cross-site scripting rce remote code execution "
+              "web application exploit CVE public-facing server buffer overflow "
+              "command injection path traversal directory traversal LFI RFI SSRF",
+    # Ingress tool transfer / file download
+    "T1105": "file download http download wget curl executable download "
+              "binary transfer tool transfer payload delivery",
+    # Brute force / password attacks
+    "T1110": "brute force password spray credential stuffing login attempt "
+              "ssh brute force rdp brute force dictionary attack",
+    # Network scanning
+    "T1046": "nmap port scan network scan host discovery service enumeration "
+              "vulnerability scan masscan zmap",
+    # DNS C2
+    "T1071.004": "dns c2 dns tunneling command and control beacon dns query malware domain",
+    # Phishing
+    "T1566": "phishing spearphishing email attachment malicious link credential harvest",
+    # PowerShell
+    "T1059.001": "powershell script execution encoded command invoke-expression iex bypass",
+    # Lateral movement via SMB
+    "T1021.002": "smb lateral movement psexec wmic admin share pass-the-hash",
+    # Credential dumping
+    "T1003": "credential dump mimikatz lsass dump pass-the-hash ntds dit secretsdump",
+    # Exfiltration over web
+    "T1041": "data exfiltration upload http post c2 channel outbound transfer",
+}
 
 def fetch_and_parse_mitre_stix():
     """
@@ -43,11 +91,13 @@ def fetch_and_parse_mitre_stix():
                     external_id = ref.get("external_id", "N/A")
                     break
 
-          # Format chunk for Vector DB (Optimized for better semantic match)
+            # Format chunk for Vector DB (Optimized for better semantic match)
+            extra_keywords = KEYWORD_ENRICHMENT.get(external_id, "")
             content = (
                 f"Technique Name: {tech_name}\n"
                 f"MITRE ID: {external_id}\n"
-                f"Summary: {tech_name} - {tech_desc[:250]}"
+                f"Summary: {tech_name} - {tech_desc[:500]}"
+                + (f"\nKeywords: {extra_keywords}" if extra_keywords else "")
             )
             
             metadata = {
@@ -83,18 +133,100 @@ def build_or_load_vector_db():
 # Initialize Vector DB Singleton
 vector_store = build_or_load_vector_db()
 
+# Initialize Ensemble Retriever for Hybrid Search
+ensemble_retriever = None
+if vector_store and BM25Retriever and EnsembleRetriever:
+    print("[*] Extracting documents from FAISS docstore for Hybrid Search...")
+    try:
+        mitre_docs = list(vector_store.docstore._dict.values())
+        bm25_retriever = BM25Retriever.from_documents(mitre_docs)
+        bm25_retriever.k = 10
+        
+        ensemble_retriever = EnsembleRetriever(
+            retrievers=[bm25_retriever, vector_store.as_retriever(search_kwargs={"k": 10})],
+            weights=[0.4, 0.6]
+        )
+        print("[+] Hybrid Ensemble Retriever successfully initialized!")
+    except Exception as e:
+        print(f"[!] Error initializing Hybrid Retriever: {e}")
 
-def retrieve_mitre_context(alert_signature, top_k=1):
+OLLAMA_URL = "http://localhost:11434/api/generate"
+
+
+def _format_fallback(results: list) -> str:
+    """Return a clean top-3 candidate summary when Ollama is unavailable."""
+    lines = ["[Ollama unavailable — showing top RAG candidates]\n"]
+    for i, doc in enumerate(results[:3], 1):
+        mid  = doc.metadata.get("mitre_id", "N/A")
+        name = doc.metadata.get("name", "Unknown")
+        # First 180 chars of description only
+        snippet = doc.page_content.split("Summary:")[-1].strip()[:180]
+        lines.append(f"#{i}  MITRE ID: {mid}  |  {name}\n    {snippet}\n")
+    return "\n".join(lines)
+
+
+def retrieve_mitre_context(alert_signature, top_k=10):
     """
     Search vector DB for relevant MITRE ATT&CK techniques based on Suricata Alert signature
+    and use local Llama 3.2 to select the most accurate technique from top candidates.
     """
     if not vector_store:
         return "No MITRE Knowledge Base loaded."
         
-    results = vector_store.similarity_search(alert_signature, k=top_k)
-    if results:
-        return results[0].page_content
-    return "No direct MITRE ATT&CK mapping found."
+    if ensemble_retriever:
+        results = ensemble_retriever.invoke(alert_signature)
+    else:
+        results = vector_store.similarity_search(alert_signature, k=top_k)
+        
+    if not results:
+        return "No direct MITRE ATT&CK mapping found."
+        
+    # Ensure we only process at most top_k results
+    results = results[:top_k]
+        
+    # Format candidates
+    candidates_list = []
+    for idx, doc in enumerate(results):
+        candidates_list.append(f"Candidate {idx+1}:\n{doc.page_content}")
+    formatted_candidates = "\n\n".join(candidates_list)
+    
+    prompt = f"""
+You are a cybersecurity analyst mapping alerts to MITRE ATT&CK techniques.
+
+Alert: "{alert_signature}"
+
+Here are the top candidate MITRE techniques retrieved by similarity search:
+{formatted_candidates}
+
+Task: Select the MOST accurate technique for this alert based on actual attack behavior, 
+not just keyword overlap. If none fit well, say so.
+
+Return format:
+MITRE ID: 
+Technique Name: 
+Reasoning: 
+"""
+    
+    payload = {
+        "model": "llama3.2",
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "temperature": 0.0,
+            "num_predict": 150
+        }
+    }
+    
+    try:
+        response = requests.post(OLLAMA_URL, json=payload, timeout=90)
+        if response.status_code == 200:
+            return response.json().get("response", "No response from model.").strip()
+        else:
+            print(f"[!] Ollama API returned status code {response.status_code}")
+            return _format_fallback(results)
+    except Exception as e:
+        print(f"[!] Ollama unavailable ({type(e).__name__}). Returning top candidates.")
+        return _format_fallback(results)
 
 
 if __name__ == "__main__":
@@ -111,7 +243,7 @@ if __name__ == "__main__":
     print("="*50)
 
     for query in test_queries:
-        print(f"\n🔍 Query: '{query}'")
+        print(f"\n[Query] '{query}'")
         context = retrieve_mitre_context(query)
-        print(f"📖 Retrieved Context:\n{context}")
+        print(f"[Retrieved Context]\n{context}")
         print("-" * 50)
