@@ -3,6 +3,7 @@ import requests
 import csv
 import os
 import time
+import pandas as pd
 from threat_intel import check_abuseipdb, check_virustotal
 from rag_mitre import retrieve_mitre_context
 
@@ -15,6 +16,65 @@ else:
 
 CSV_DATABASE = "alert_history.csv"
 OLLAMA_URL = "http://localhost:11434/api/generate"
+
+def query_logs_with_llm(user_query: str, df: pd.DataFrame):
+    """
+    Converts Natural Language Query into pandas filtering logic using Llama 3.2
+    and returns filtered records or summary answer.
+    """
+    if df.empty:
+        return "No log data available to analyze.", pd.DataFrame()
+
+    # Column names and sample values for LLM context
+    df_context = {
+        "columns": list(df.columns),
+        "sample_data": df.head(2).to_dict(orient="records")
+    }
+
+    prompt = f"""
+    You are an AI Log Query Assistant for a SOC Analyst Dashboard.
+    
+    Data Schema Context:
+    - Available Columns: {df_context['columns']}
+    - Sample Records: {json.dumps(df_context['sample_data'])}
+
+    User Query: "{user_query}"
+
+    Task:
+    1. Analyze the user request.
+    2. Write a single line Python Pandas executable expression to filter the DataFrame `df`.
+       Example 1: df[df['signature'].str.contains('SSH', case=False, na=False)]
+       Example 2: df[df['severity'] == 'High']
+    3. Return ONLY a JSON object with this exact key:
+    {{
+        "pandas_query": "YOUR_PANDAS_FILTER_EXPRESSION_HERE",
+        "explanation": "Brief explanation of what was filtered"
+    }}
+    """
+
+    payload = {
+        "model": "llama3.2",
+        "prompt": prompt,
+        "stream": False,
+        "format": "json"
+    }
+
+    try:
+        res = requests.post("http://localhost:11434/api/generate", json=payload)
+        response_json = json.loads(res.json().get("response", "{}"))
+        
+        pandas_code = response_json.get("pandas_query", "")
+        explanation = response_json.get("explanation", "Filtered based on query.")
+
+        # Safely evaluate pandas filtering expression
+        if pandas_code and "df[" in pandas_code:
+            filtered_df = eval(pandas_code)
+            return explanation, filtered_df
+        else:
+            return "Could not construct a precise filter. Showing all logs.", df
+
+    except Exception as e:
+        return f"Query Execution Error: {str(e)}", pd.DataFrame()
 
 def query_llama_mitre(alert_data, abuse_data=None, vt_data=None):
     # Retrieve Ground-Truth MITRE Context via FAISS RAG
@@ -178,6 +238,7 @@ def stream_suricata_logs(tail=True):
                     
             except json.JSONDecodeError:
                 continue
+            
 
 if __name__ == "__main__":
     import sys
@@ -196,3 +257,4 @@ if __name__ == "__main__":
         stream_suricata_logs(tail=tail_mode)
     except KeyboardInterrupt:
         print("\n[*] Log listener stopped by user.")
+        

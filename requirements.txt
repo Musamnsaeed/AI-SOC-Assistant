@@ -1,0 +1,8 @@
+streamlit
+pandas
+requests
+faiss-cpu
+sentence-transformers
+langchain-community
+langchain-huggingface
+langchain-core

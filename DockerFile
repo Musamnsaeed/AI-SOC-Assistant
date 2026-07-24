@@ -1,0 +1,25 @@
+# Python 3.10 Base Image
+FROM python:3.10-slim
+
+# System dependencies install karein (FAISS aur C++ libraries ke liye)
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    curl \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Working Directory set karein
+WORKDIR /app
+
+# Requirements file copy aur install karein
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Baaki saara project code copy karein
+COPY . .
+
+# Streamlit Port Expose karein
+EXPOSE 8501
+
+# Streamlit Application Run karein
+CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0"]
