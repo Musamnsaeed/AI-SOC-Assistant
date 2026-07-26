@@ -51,7 +51,7 @@ def query_llama(parsed_data):
     }
     
     try:
-        response = requests.post(url, json=payload, timeout=10)
+        response = requests.post(url, json=payload, timeout=90)
         return response.json().get("response", "{}")
     except Exception as e:
         print(f"Error connecting to Ollama: {e}")
@@ -118,6 +118,6 @@ if __name__ == "__main__":
                 print(f"    AI Response: {ai_response.strip()}")
                 
                 log_to_csv(parsed, ai_response)
-                print("    [✓] Log and AI verdict saved to alert_history.csv")
+                print("    [OK] Log and AI verdict saved to alert_history.csv")
             else:
                 print(f"[-] Could not parse line: {line.strip()}")
