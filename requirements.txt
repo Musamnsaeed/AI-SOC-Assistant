@@ -6,3 +6,4 @@ sentence-transformers
 langchain-community
 langchain-huggingface
 langchain-core
+plotly

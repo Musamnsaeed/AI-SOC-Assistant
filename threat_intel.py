@@ -1,8 +1,8 @@
 import requests
 
 # Public API Keys (Replace with your actual keys)
-ABUSEIPDB_API_KEY = "YOUR_ABUSEIPDB_API_KEY"
-VIRUSTOTAL_API_KEY = "YOUR_VIRUSTOTAL_API_KEYgit add ."
+ABUSEIPDB_API_KEY = "add your api key"
+VIRUSTOTAL_API_KEY = "add your api key"
 
 def clean_ip(ip_address):
     if not ip_address:

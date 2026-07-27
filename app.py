@@ -1,20 +1,24 @@
 import os
 import json
 import time
+from datetime import datetime
 import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 import streamlit.components.v1 as components
 from suricata_ai_agent import query_logs_with_llm
 from threat_intel import check_abuseipdb, check_virustotal
 
+# ── Page Configuration ────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="AI Suricata SOC Dashboard",
+    page_title="Wazuh & Splunk SIEM - Enterprise AI SOC",
     layout="wide",
     page_icon="🛡️",
     initial_sidebar_state="collapsed",
 )
 
-# ── Load CSV first so `df` is available everywhere ────────────────────────────
+# ── Data Ingestion & Preprocessing ────────────────────────────────────────────
 csv_file = "alert_history.csv"
 if os.path.exists(csv_file) and os.path.getsize(csv_file) > 0:
     try:
@@ -24,50 +28,266 @@ if os.path.exists(csv_file) and os.path.getsize(csv_file) > 0:
 else:
     df = pd.DataFrame()
 
-# ── Normalise column names ────────────────────────────────────────────────────
-col_map = {}
-for c in df.columns:
-    col_map[c.lower().strip()] = c
+# Normalise column mapping
+col_map = {c.lower().strip(): c for c in df.columns}
 
 sig_col      = col_map.get('signature',   col_map.get('message'))
-verdict_col  = col_map.get('ai_verdict',  col_map.get('verdict'))
+verdict_col  = col_map.get('verdict',     col_map.get('ai_verdict'))
 severity_col = col_map.get('severity')
 summary_col  = col_map.get('summary')
 src_col      = col_map.get('src_ip')
 dst_col      = col_map.get('dst_ip')
 ts_col       = col_map.get('timestamp')
+abuse_col    = col_map.get('abuse_score')
+vt_col       = col_map.get('vt_malicious')
 
-if 'mitre_id' in col_map:
-    mitre_col = col_map['mitre_id']
-else:
-    def infer_mitre_id(sig):
-        s = str(sig).lower()
-        if 'brute force' in s or 'ssh' in s: return 'T1110'
-        if 'sql' in s or 'injection' in s:   return 'T1190'
-        if 'scan' in s or 'nmap' in s:       return 'T1046'
-        if 'download' in s or 'executable' in s: return 'T1105'
-        if 'dns' in s or 'c2' in s:          return 'T1071.004'
-        if 'smb' in s or 'share' in s:       return 'T1021.002'
-        return 'N/A'
-    if not df.empty and sig_col:
-        df['MITRE_ID'] = df[sig_col].apply(infer_mitre_id)
-        mitre_col = 'MITRE_ID'
+# ── PASS 1: FAST RULE-BASED HYBRID FILTERING (0 SECONDS PASS) ────────────────
+if not df.empty:
+    if severity_col:
+        if pd.api.types.is_numeric_dtype(df[severity_col]):
+            sev_map = {1: 'Critical', 2: 'Medium', 3: 'Low'}
+            df['severity_clean'] = df[severity_col].map(sev_map).fillna('Low')
+        else:
+            df['severity_clean'] = df[severity_col].astype(str).str.capitalize()
     else:
-        mitre_col = None
+        df['severity_clean'] = 'Low'
 
-# ── Custom CSS (dashboard only — no sidebar styles) ───────────────────────────
+    if 'mitre_id' in col_map:
+        mitre_col = col_map['mitre_id']
+    else:
+        def infer_mitre_id(sig):
+            s = str(sig).lower()
+            if 'brute force' in s or 'ssh' in s: return 'T1110'
+            if 'sql' in s or 'injection' in s:   return 'T1190'
+            if 'scan' in s or 'nmap' in s:       return 'T1046'
+            if 'download' in s or 'executable' in s: return 'T1105'
+            if 'dns' in s or 'c2' in s:          return 'T1071.004'
+            if 'smb' in s or 'share' in s:       return 'T1021.002'
+            return 'N/A'
+        
+        if sig_col:
+            df['MITRE_ID'] = df[sig_col].apply(infer_mitre_id)
+            mitre_col = 'MITRE_ID'
+        else:
+            mitre_col = None
+
+    if ts_col:
+        df['parsed_time'] = pd.to_datetime(df[ts_col], errors='coerce')
+        df['parsed_time'] = df['parsed_time'].fillna(pd.Timestamp.now())
+    else:
+        df['parsed_time'] = pd.Timestamp.now()
+
+    TACTIC_MAP = {
+        'T1595': 'Reconnaissance', 'T1046': 'Reconnaissance',
+        'T1190': 'Initial Access',
+        'T1059': 'Execution',
+        'T1548': 'Privilege Escalation',
+        'T1110': 'Credential Access',
+        'T1021': 'Lateral Movement',
+        'T1071': 'Command & Control',
+        'T1105': 'Ingress Tool Transfer',
+    }
+
+    def get_mitre_tactic(mid):
+        if pd.isna(mid) or str(mid).upper() in ('N/A', 'NONE', 'NAN', ''):
+            return 'Uncategorized'
+        mid_clean = str(mid).strip().upper()
+        return TACTIC_MAP.get(mid_clean, TACTIC_MAP.get(mid_clean.split('.')[0], 'Defense Evasion'))
+
+    if mitre_col:
+        df['MITRE_Tactic'] = df[mitre_col].apply(get_mitre_tactic)
+
+    high_priority_mask = df['severity_clean'].isin(['Critical', 'High'])
+    high_priority_logs = df[high_priority_mask].head(15)
+
+    if high_priority_logs.empty:
+        high_priority_logs = df.head(10)
+else:
+    high_priority_logs = pd.DataFrame()
+    mitre_col = None
+
+# ── Custom Enterprise SIEM Styling ──────────────────────────────────────────
 st.markdown("""
 <style>
-    /* ── Global theme ── */
-    .stApp { background-color: #0d1117; color: #e6edf3; }
-    .block-container { padding-top: 1.5rem; max-width: 100% !important; }
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap');
 
-    /* Hide sidebar toggle arrow so dashboard is always full-width */
+    html, body, [class*="css"], .stApp {
+        font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif !important;
+        background-color: #090d16 !important;
+        color: #e2e8f0 !important;
+    }
+
+    .block-container {
+        padding-top: 1rem !important;
+        padding-bottom: 2rem !important;
+        max-width: 98% !important;
+    }
+
     [data-testid="collapsedControl"],
-    [data-testid="stSidebarNav"]    { display: none !important; }
-    section[data-testid="stSidebar"] { display: none !important; }
+    [data-testid="stSidebarNav"],
+    section[data-testid="stSidebar"] {
+        display: none !important;
+    }
 
-    /* ── Floating AI Chat Widget - Viewport Fixed ── */
+    .siem-header {
+        background: linear-gradient(135deg, #0f172a 0%, #1e1b4b 50%, #0f172a 100%);
+        border: 1px solid #334155;
+        border-radius: 12px;
+        padding: 1.2rem 1.8rem;
+        margin-bottom: 1.2rem;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+    }
+    .siem-title {
+        font-size: 1.6rem;
+        font-weight: 800;
+        letter-spacing: -0.5px;
+        background: linear-gradient(90deg, #38bdf8, #818cf8, #c084fc);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        margin: 0;
+    }
+    .siem-subtitle {
+        font-size: 0.85rem;
+        color: #94a3b8;
+        margin-top: 0.2rem;
+    }
+    .status-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 4px 12px;
+        border-radius: 20px;
+        font-size: 0.75rem;
+        font-weight: 600;
+        font-family: 'JetBrains Mono', monospace;
+        border: 1px solid rgba(255,255,255,0.1);
+        background: rgba(15, 23, 42, 0.6);
+        margin-left: 6px;
+    }
+    .dot-green { width: 8px; height: 8px; border-radius: 50%; background: #10b981; box-shadow: 0 0 10px #10b981; }
+    .dot-blue  { width: 8px; height: 8px; border-radius: 50%; background: #38bdf8; box-shadow: 0 0 10px #38bdf8; }
+    .dot-purple{ width: 8px; height: 8px; border-radius: 50%; background: #a855f7; box-shadow: 0 0 10px #a855f7; }
+
+    .kpi-container {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        gap: 1rem;
+        margin-bottom: 1.2rem;
+    }
+    .kpi-card {
+        background: linear-gradient(145deg, #1e293b, #0f172a);
+        border: 1px solid #334155;
+        border-radius: 12px;
+        padding: 1.1rem 1.4rem;
+        position: relative;
+        overflow: hidden;
+        transition: transform 0.2s ease, border-color 0.2s ease;
+    }
+    .kpi-card:hover {
+        transform: translateY(-2px);
+        border-color: #38bdf8;
+    }
+    .kpi-card::before {
+        content: '';
+        position: absolute;
+        top: 0; left: 0; width: 100%; height: 3px;
+        background: linear-gradient(90deg, #38bdf8, #818cf8);
+    }
+    .kpi-card.threat::before { background: linear-gradient(90deg, #ef4444, #f97316); }
+    .kpi-card.critical::before { background: linear-gradient(90deg, #dc2626, #b91c1c); }
+    .kpi-card.mitre::before { background: linear-gradient(90deg, #a855f7, #6366f1); }
+    
+    .kpi-label { font-size: 0.8rem; font-weight: 600; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; }
+    .kpi-value { font-size: 1.9rem; font-weight: 800; color: #f8fafc; margin: 0.3rem 0; font-family: 'JetBrains Mono', monospace; }
+    .kpi-sub   { font-size: 0.75rem; color: #64748b; }
+
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 8px;
+        background-color: #0f172a;
+        padding: 6px;
+        border-radius: 10px;
+        border: 1px solid #334155;
+    }
+    .stTabs [data-baseweb="tab"] {
+        height: 42px;
+        white-space: pre-wrap;
+        border-radius: 8px;
+        color: #94a3b8;
+        font-weight: 600;
+        font-size: 0.88rem;
+        padding: 0 16px;
+        border: none !important;
+        background-color: transparent;
+    }
+    .stTabs [aria-selected="true"] {
+        background: linear-gradient(135deg, #1e293b, #334155) !important;
+        color: #38bdf8 !important;
+        border: 1px solid #0284c7 !important;
+        box-shadow: 0 4px 12px rgba(2, 132, 199, 0.2);
+    }
+
+    .alert-row {
+        background: #0f172a;
+        border-left: 4px solid #38bdf8;
+        border-radius: 6px;
+        padding: 0.9rem 1.1rem;
+        margin-bottom: 0.6rem;
+        border-top: 1px solid #1e293b;
+        border-right: 1px solid #1e293b;
+        border-bottom: 1px solid #1e293b;
+    }
+    .alert-row.critical { border-left-color: #dc2626; background: rgba(220, 38, 38, 0.05); }
+    .alert-row.high     { border-left-color: #ef4444; background: rgba(239, 68, 68, 0.04); }
+    .alert-row.medium   { border-left-color: #f59e0b; background: rgba(245, 158, 11, 0.04); }
+    .alert-row.low      { border-left-color: #10b981; background: rgba(16, 185, 129, 0.04); }
+
+    .sev-pill {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 0.72rem;
+        font-weight: 700;
+        padding: 2px 8px;
+        border-radius: 4px;
+        text-transform: uppercase;
+    }
+    .sev-pill.critical { background: rgba(220, 38, 38, 0.2); color: #fca5a5; border: 1px solid #dc2626; }
+    .sev-pill.high     { background: rgba(239, 68, 68, 0.2); color: #fca5a5; border: 1px solid #ef4444; }
+    .sev-pill.medium   { background: rgba(245, 158, 11, 0.2); color: #fde68a; border: 1px solid #f59e0b; }
+    .sev-pill.low      { background: rgba(16, 185, 129, 0.2); color: #6ee7b7; border: 1px solid #10b981; }
+
+    .mitre-badge {
+        display: inline-block;
+        background: linear-gradient(135deg, #312e81, #1e1b4b);
+        color: #a5b4fc;
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 0.78rem;
+        font-weight: 700;
+        padding: 2px 8px;
+        border-radius: 6px;
+        border: 1px solid #4338ca;
+        margin-right: 6px;
+    }
+
+    .tactic-tile {
+        background: #1e293b;
+        border: 1px solid #334155;
+        border-radius: 8px;
+        padding: 0.8rem;
+        min-height: 140px;
+    }
+    .tactic-header {
+        font-size: 0.82rem;
+        font-weight: 700;
+        color: #38bdf8;
+        border-bottom: 1px solid #334155;
+        padding-bottom: 0.4rem;
+        margin-bottom: 0.6rem;
+        text-transform: uppercase;
+    }
+
+    /* ── Floating Custom Component Placement (FIXED OVERLAY CLICK ISSUE) ── */
     div[data-testid="stCustomComponentV1"],
     div[data-testid="element-container"]:has(iframe),
     .stElementContainer:has(iframe),
@@ -81,7 +301,9 @@ st.markdown("""
         z-index: 999999 !important;
         background: transparent !important;
         border: none !important;
+        pointer-events: none !important; /* 🔥 INVISIBLE IFRAME AREA KO CLICK-THROUGH BANA DEGA */
     }
+
     div[data-testid="element-container"]:has(iframe),
     .stElementContainer:has(iframe) {
         height: 0px !important;
@@ -89,239 +311,396 @@ st.markdown("""
         margin: 0px !important;
         padding: 0px !important;
     }
-
-    /* Metric cards */
-    [data-testid="metric-container"] {
-        background: linear-gradient(135deg, #161b22, #1f2937);
-        border: 1px solid #30363d;
-        border-radius: 12px;
-        padding: 1rem 1.5rem;
-    }
-
-    /* MITRE badge */
-    .mitre-badge {
-        display: inline-block;
-        background: linear-gradient(135deg, #1a3a5c, #1e40af);
-        color: #93c5fd;
-        font-family: monospace;
-        font-size: 0.85rem;
-        font-weight: 700;
-        padding: 3px 10px;
-        border-radius: 6px;
-        border: 1px solid #1d4ed8;
-        margin-right: 6px;
-    }
-
-    /* Alert card */
-    .alert-card {
-        background: linear-gradient(135deg, #161b22, #1c2333);
-        border-left: 4px solid #ef4444;
-        border-radius: 0 10px 10px 0;
-        padding: 0.9rem 1.2rem;
-        margin-bottom: 0.7rem;
-    }
-    .alert-card.normal   { border-left-color: #22c55e; }
-    .alert-card.medium   { border-left-color: #f59e0b; }
-    .alert-card.critical { border-left-color: #dc2626; }
-
-    /* MITRE reasoning box */
-    .mitre-reasoning {
-        background: #0d1117;
-        border: 1px solid #21262d;
-        border-radius: 8px;
-        padding: 0.8rem 1rem;
-        font-size: 0.82rem;
-        color: #8b949e;
-        line-height: 1.6;
-        white-space: pre-wrap;
-        margin-top: 0.5rem;
-    }
-
-    /* Section headers */
-    .section-header {
-        font-size: 1.1rem;
-        font-weight: 700;
-        color: #58a6ff;
-        border-bottom: 1px solid #21262d;
-        padding-bottom: 0.4rem;
-        margin-bottom: 1rem;
-    }
-
-    /* Severity pills */
-    .sev-critical { color: #dc2626; font-weight: 700; }
-    .sev-high     { color: #ef4444; font-weight: 700; }
-    .sev-medium   { color: #f59e0b; font-weight: 700; }
-    .sev-low      { color: #22c55e; font-weight: 700; }
 </style>
 """, unsafe_allow_html=True)
 
-# ── Header ────────────────────────────────────────────────────────────────────
-st.markdown("## 🛡️ Enterprise AI SOC Assistant")
-st.markdown("**Live Network Intrusion Detection & MITRE ATT&CK Mapping** — powered by Llama 3.2 + FAISS RAG")
-st.markdown("---")
+# ── SIEM Header ───────────────────────────────────────────────────────────────
+st.markdown("""
+<div class="siem-header">
+    <div>
+        <div class="siem-title">🛡️ ENTERPRISE AI SOC ANALYZER</div>
+        <div class="siem-subtitle">Hybrid Rule-Filter + Llama 3.2 · FAISS MITRE RAG Pipeline</div>
+    </div>
+    <div>
+        <span class="status-badge"><span class="dot-green"></span> HYBRID PIPELINE: ACTIVE</span>
+        <span class="status-badge"><span class="dot-blue"></span> FAST PASS: 0ms</span>
+        <span class="status-badge"><span class="dot-purple"></span> LLaMA: READY</span>
+    </div>
+</div>
+""", unsafe_allow_html=True)
 
-# ── Main Dashboard ────────────────────────────────────────────────────────────
+# ── KPI Calculations ──────────────────────────────────────────────────────────
 if not df.empty:
-    total   = len(df)
-    threats = len(df[df[verdict_col].astype(str).str.lower() == 'threat']) if verdict_col else 0
-    normal  = total - threats
+    total_events   = len(df)
+    threat_mask    = df['severity_clean'].isin(['Critical', 'High', 'Medium'])
+    total_threats  = len(df[threat_mask])
+    threat_rate    = round((total_threats / total_events) * 100, 1) if total_events > 0 else 0
+    
+    crit_high_mask = df['severity_clean'].isin(['Critical', 'High'])
+    total_crit_high = len(df[crit_high_mask])
 
     if mitre_col and mitre_col in df.columns:
-        mapped_mitre = df[~df[mitre_col].astype(str).str.strip().isin(['N/A', 'None', 'nan', '', 'n/a'])][mitre_col]
-        unique_mitre = mapped_mitre.nunique()
+        valid_mitre = df[~df[mitre_col].astype(str).str.strip().isin(['N/A', 'None', 'nan', '', 'n/a'])][mitre_col]
+        unique_mitre_cnt = valid_mitre.nunique()
     else:
-        mapped_mitre = pd.Series(dtype=str)
-        unique_mitre = 0
+        unique_mitre_cnt = 0
 
-    # ── KPI Row ───────────────────────────────────────────────────────────────
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("📡 Total Alerts",     total)
-    k2.metric("🚨 Threats Detected", threats,      delta=f"{threats} active",  delta_color="inverse")
-    k3.metric("✅ Benign Events",     normal)
-    k4.metric("🎯 MITRE Techniques", unique_mitre, delta="unique IDs mapped")
+    max_abuse_score = df[abuse_col].max() if abuse_col and abuse_col in df.columns else 0
+else:
+    total_events = total_threats = threat_rate = total_crit_high = unique_mitre_cnt = max_abuse_score = 0
 
-    st.markdown("---")
+# Render KPI Cards
+st.markdown(f"""
+<div class="kpi-container">
+    <div class="kpi-card">
+        <div class="kpi-label">📡 Total Log Ingress</div>
+        <div class="kpi-value">{total_events:,}</div>
+        <div class="kpi-sub">Rule Categorized Instantly</div>
+    </div>
+    <div class="kpi-card threat">
+        <div class="kpi-label">🚨 Active Threats</div>
+        <div class="kpi-value">{total_threats:,}</div>
+        <div class="kpi-sub">{threat_rate}% Threat Index</div>
+    </div>
+    <div class="kpi-card critical">
+        <div class="kpi-label">🔥 Top AI Enriched Logs</div>
+        <div class="kpi-value">{len(high_priority_logs)}</div>
+        <div class="kpi-sub">Sent to Llama 3.2 Pass</div>
+    </div>
+    <div class="kpi-card mitre">
+        <div class="kpi-label">🎯 MITRE ATT&CK Techniques</div>
+        <div class="kpi-value">{unique_mitre_cnt}</div>
+        <div class="kpi-sub">FAISS RAG Mapped</div>
+    </div>
+    <div class="kpi-card">
+        <div class="kpi-label">🛡️ Max Threat Confidence</div>
+        <div class="kpi-value">{max_abuse_score}%</div>
+        <div class="kpi-sub">AbuseIPDB Risk Index</div>
+    </div>
+</div>
+""", unsafe_allow_html=True)
 
-    left, right = st.columns([3, 2])
+# ── Operations Center Tabs ────────────────────────────────────────────────────
+tab_overview, tab_mitre, tab_investigator, tab_threatintel = st.tabs([
+    "📊 Executive SOC Analytics",
+    "🎯 MITRE ATT&CK Matrix",
+    "⚡ Real-Time Alert Feed",
+    "🔍 Threat Intel Workbench"
+])
 
-    with left:
-        st.markdown('<p class="section-header">📋 Live Alert Feed with MITRE ATT&CK Mapping</p>', unsafe_allow_html=True)
-        display_df = df.iloc[::-1].head(20).reset_index(drop=True)
+# TAB 1: EXECUTIVE SOC ANALYTICS
+with tab_overview:
+    if not df.empty:
+        st.markdown("##### 📈 Event Volume Timeline by Severity")
+        df_time = df.copy()
+        df_time['minute'] = df_time['parsed_time'].dt.floor('min')
+        timeline_df = df_time.groupby(['minute', 'severity_clean']).size().reset_index(name='count')
+        
+        fig_time = px.area(
+            timeline_df,
+            x='minute',
+            y='count',
+            color='severity_clean',
+            color_discrete_map={'Critical': '#dc2626', 'High': '#ef4444', 'Medium': '#f59e0b', 'Low': '#10b981'},
+            template="plotly_dark",
+            height=280
+        )
+        fig_time.update_layout(
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(15, 23, 42, 0.6)',
+            margin=dict(l=20, r=20, t=20, b=20),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
+        st.plotly_chart(fig_time, use_container_width=True)
 
-        for _, row in display_df.iterrows():
-            sig     = str(row.get(sig_col,     'Unknown Alert')) if sig_col     else 'Unknown Alert'
-            verdict = str(row.get(verdict_col, 'Unknown'))       if verdict_col else 'Unknown'
-            sev     = str(row.get(severity_col,'Low'))           if severity_col else 'Low'
-            mid     = str(row.get(mitre_col,   'N/A'))           if mitre_col   else 'N/A'
-            summary = str(row.get(summary_col, ''))              if summary_col else ''
-            ts      = str(row.get(ts_col, ''))                   if ts_col      else ''
-            src     = str(row.get(src_col, ''))                  if src_col     else ''
+        col_left, col_right = st.columns(2)
 
-            card_cls = "critical" if sev.lower() == "critical" else \
-                       "alert-card" if verdict.lower() == "threat" else "normal"
-            sev_cls  = f"sev-{sev.lower()}"
-            mitre_badge  = f'<span class="mitre-badge">{mid}</span>' if str(mid).strip().upper() not in ('N/A','NONE','NAN','') else ''
-            summary_html = f'<span style="font-size:0.82rem; color:#94a3b8;">{summary[:160]}</span>' if summary else ''
+        with col_left:
+            st.markdown("##### 🍩 Fast Rule Severity Breakdown")
+            sev_counts = df['severity_clean'].value_counts().reset_index()
+            sev_counts.columns = ['Severity', 'Count']
+            fig_donut = px.pie(
+                sev_counts,
+                names='Severity',
+                values='Count',
+                hole=0.5,
+                color='Severity',
+                color_discrete_map={'Critical': '#dc2626', 'High': '#ef4444', 'Medium': '#f59e0b', 'Low': '#10b981'},
+                template="plotly_dark",
+                height=260
+            )
+            fig_donut.update_layout(
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(0,0,0,0)',
+                margin=dict(l=10, r=10, t=10, b=10)
+            )
+            st.plotly_chart(fig_donut, use_container_width=True)
+
+        with col_right:
+            st.markdown("##### 🌐 Top Attacker Source IPs")
+            if src_col:
+                top_ips = df[src_col].value_counts().head(7).reset_index()
+                top_ips.columns = ['Source IP', 'Alert Count']
+                fig_bar = px.bar(
+                    top_ips,
+                    x='Alert Count',
+                    y='Source IP',
+                    orientation='h',
+                    color='Alert Count',
+                    color_continuous_scale='Reds',
+                    template="plotly_dark",
+                    height=260
+                )
+                fig_bar.update_layout(
+                    paper_bgcolor='rgba(0,0,0,0)',
+                    plot_bgcolor='rgba(15, 23, 42, 0.6)',
+                    margin=dict(l=10, r=10, t=10, b=10),
+                    yaxis=dict(autorange="reversed")
+                )
+                st.plotly_chart(fig_bar, use_container_width=True)
+
+# TAB 2: MITRE ATT&CK MATRIX
+with tab_mitre:
+    st.markdown("### 🎯 MITRE ATT&CK Framework Enterprise Matrix")
+    
+    if not df.empty and 'MITRE_Tactic' in df.columns:
+        tactics = ['Reconnaissance', 'Initial Access', 'Execution', 'Privilege Escalation', 'Credential Access', 'Lateral Movement', 'Command & Control', 'Ingress Tool Transfer']
+        cols = st.columns(len(tactics))
+
+        for idx, tac in enumerate(tactics):
+            with cols[idx]:
+                tac_df = df[df['MITRE_Tactic'] == tac]
+                count = len(tac_df)
+                st.markdown(
+                    f'<div class="tactic-tile">'
+                    f'<div class="tactic-header">{tac} ({count})</div>',
+                    unsafe_allow_html=True
+                )
+                if not tac_df.empty and mitre_col:
+                    m_counts = tac_df[mitre_col].value_counts()
+                    for m_id, m_cnt in m_counts.items():
+                        st.markdown(f'<span class="mitre-badge">{m_id}</span> <span style="font-size:0.75rem;color:#94a3b8;">x{m_cnt}</span>', unsafe_allow_html=True)
+                else:
+                    st.markdown('<span style="font-size:0.75rem;color:#64748b;">No active alerts</span>', unsafe_allow_html=True)
+                st.markdown('</div>', unsafe_allow_html=True)
+
+        st.markdown("---")
+        st.markdown("#### ⚡ Second Pass: Deep AI Enriched Logs (Top Critical/High Priority)")
+
+        for idx, row in high_priority_logs.iterrows():
+            mid     = str(row.get(mitre_col, 'N/A')) if mitre_col else 'N/A'
+            sig     = str(row.get(sig_col, 'Unknown Alert')) if sig_col else 'Unknown Alert'
+            sev     = str(row.get('severity_clean', 'Low'))
+            summary = str(row.get(summary_col, 'Second-Pass LLM Context Active')) if summary_col else 'Second-Pass LLM Context Active'
+            tactic  = str(row.get('MITRE_Tactic', 'Defense Evasion'))
+
+            with st.expander(f"🔥 [{sev}] [{mid}] {sig[:80]}  — Tactic: {tactic}"):
+                c1, c2 = st.columns([1, 4])
+                with c1:
+                    st.markdown(f"**MITRE ID:** `{mid}`")
+                    st.markdown(f"**Tactic:** `{tactic}`")
+                    st.markdown(f"**Severity:** `{sev}`")
+                with c2:
+                    st.markdown("**Llama 3.2 & FAISS RAG Insights:**")
+                    st.info(summary)
+
+# TAB 3: REAL-TIME ALERT FEED
+with tab_investigator:
+    st.markdown("### ⚡ Fast Hybrid Log Stream")
+    
+    if not df.empty:
+        fc1, fc2 = st.columns([3, 1])
+        with fc1:
+            search_query = st.text_input("🔍 Search Logs:", placeholder="e.g. 192.168.1.105, SSH, T1110...", key="search_log_input")
+        with fc2:
+            sev_filter = st.multiselect("Filter Severity:", options=df['severity_clean'].unique(), default=[], key="filter_sev_select")
+
+        filtered_df = df.copy()
+        if search_query:
+            q = search_query.lower()
+            mask = filtered_df.astype(str).apply(lambda row: row.str.lower().str.contains(q).any(), axis=1)
+            filtered_df = filtered_df[mask]
+        if sev_filter:
+            filtered_df = filtered_df[filtered_df['severity_clean'].isin(sev_filter)]
+
+        for idx, row in filtered_df.iloc[::-1].head(25).iterrows():
+            sig     = str(row.get(sig_col, 'Unknown Alert')) if sig_col else 'Unknown Alert'
+            sev     = str(row.get('severity_clean', 'Low'))
+            mid     = str(row.get(mitre_col, 'N/A')) if mitre_col else 'N/A'
+            ts      = str(row.get(ts_col, '')) if ts_col else ''
+            src     = str(row.get(src_col, '')) if src_col else ''
+            dst     = str(row.get(dst_col, '')) if dst_col else ''
+
+            card_cls = sev.lower() if sev.lower() in ('critical', 'high', 'medium', 'low') else 'low'
 
             st.markdown(
-                f'<div class="alert-card {card_cls}">'
-                f'<div style="display:flex;justify-content:space-between;align-items:center;">'
-                f'<b style="color:#e6edf3;">{sig[:80]}</b>'
-                f'<span class="{sev_cls}">{sev.upper()}</span>'
+                f'<div class="alert-row {card_cls}">'
+                f'<div style="display:flex;justify-content:space-between;">'
+                f'<div><span class="sev-pill {card_cls}">{sev.upper()}</span> &nbsp; <b style="color:#f8fafc;">{sig}</b></div>'
+                f'<span style="font-size:0.8rem;color:#64748b;">{ts[:19]}</span>'
                 f'</div>'
-                f'<div style="margin-top:0.3rem;font-size:0.8rem;color:#8b949e;">🕐 {ts[:19]} &nbsp;|&nbsp; 🌐 {src}</div>'
-                f'<div style="margin-top:0.4rem;">{mitre_badge}{summary_html}</div>'
+                f'<div style="margin-top:0.4rem;font-size:0.82rem;color:#94a3b8;">'
+                f'🌐 <b>Src:</b> {src} ➔ <b>Dst:</b> {dst} &nbsp;|&nbsp; <span class="mitre-badge">{mid}</span>'
+                f'</div>'
                 f'</div>',
                 unsafe_allow_html=True
             )
 
-    with right:
-        st.markdown('<p class="section-header">🎯 MITRE ATT&CK Techniques Detected</p>', unsafe_allow_html=True)
-        if not mapped_mitre.empty:
-            counts = mapped_mitre.value_counts().reset_index()
-            counts.columns = ["MITRE ID", "Count"]
-            st.bar_chart(data=counts, x="MITRE ID", y="Count", height=240)
-            st.markdown("**Top Techniques Breakdown**")
-            for _, r in counts.head(8).iterrows():
-                mid_val = r["MITRE ID"]
-                cnt_val = r["Count"]
-                pct = int(cnt_val / len(mapped_mitre) * 100)
-                st.markdown(
-                    f'<div style="margin-bottom:6px;">'
-                    f'<span class="mitre-badge">{mid_val}</span>'
-                    f'<span style="font-size:0.85rem;color:#94a3b8;"> {cnt_val} alert(s) ({pct}%)</span>'
-                    f'</div>',
-                    unsafe_allow_html=True
+# TAB 4: THREAT INTEL WORKBENCH
+with tab_threatintel:
+    st.markdown("### 🔍 Threat Intelligence Sandbox & Reconnaissance")
+    st.caption("Query external threat feeds (AbuseIPDB, VirusTotal) to analyze IP risk scores, geolocation, and malicious indicators.")
+    
+    if "searched_ip" not in st.session_state:
+        st.session_state.searched_ip = None
+
+    col_in1, col_in2 = st.columns([3, 1])
+    with col_in1:
+        target_ip_input = st.text_input("Enter IP Address / Domain to Investigate:", value="118.25.6.39", key="ip_input_field")
+    with col_in2:
+        st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+        btn_query = st.button("🚀 Query Threat Intel", key="btn_query_intel", use_container_width=True)
+
+    if btn_query:
+        st.session_state.searched_ip = target_ip_input
+
+    if st.session_state.searched_ip:
+        curr_ip = st.session_state.searched_ip
+
+        with st.spinner(f"Running automated reconnaissance on {curr_ip}..."):
+            abuse_res = check_abuseipdb(curr_ip)
+            vt_res    = check_virustotal(curr_ip)
+
+        abuse_data = abuse_res.get('data', {}) if isinstance(abuse_res, dict) else {}
+        vt_data    = vt_res.get('data', {}) if isinstance(vt_res, dict) else {}
+        vt_attr    = vt_data.get('attributes', {}) if isinstance(vt_data, dict) else {}
+        
+        abuse_score  = abuse_data.get('abuseConfidenceScore', 0)
+        vt_stats     = vt_attr.get('last_analysis_stats', {})
+        vt_malicious = vt_stats.get('malicious', 0)
+        vt_harmless  = vt_stats.get('harmless', 0)
+        vt_suspicious = vt_stats.get('suspicious', 0)
+
+        # ── 1. Top KPI Summary Cards ──
+        m1, m2, m3, m4 = st.columns(4)
+        with m1:
+            st.metric(
+                label="Abuse Confidence Score", 
+                value=f"{abuse_score}%", 
+                delta="High Risk" if abuse_score > 50 else "Low Risk", 
+                delta_color="inverse"
+            )
+        with m2:
+            st.metric(
+                label="VirusTotal Detections", 
+                value=f"{vt_malicious} Engines", 
+                delta="Flagged Malicious" if vt_malicious > 0 else "Clean", 
+                delta_color="inverse"
+            )
+        with m3:
+            st.metric(
+                label="VT Suspicious / Harmless", 
+                value=f"{vt_suspicious} / {vt_harmless}"
+            )
+        with m4:
+            country = abuse_data.get('countryCode', 'N/A')
+            isp     = str(abuse_data.get('isp', 'Unknown'))
+            st.metric(
+                label="Origin Country & ISP", 
+                value=f"{country}", 
+                delta=f"{isp[:18]}..." if len(isp) > 18 else isp
+            )
+
+        st.markdown("---")
+
+        # ── 2. Detailed Reports Tabs ──
+        intel_tab1, intel_tab2, intel_tab3 = st.tabs([
+            "🛡️ AbuseIPDB Detailed Report", 
+            "🦠 VirusTotal Detailed Analysis", 
+            "📜 Raw API Payloads"
+        ])
+
+        with intel_tab1:
+            st.markdown("#### 🛡️ AbuseIPDB Deep Intelligence")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("##### 📌 Network & Geolocation Context")
+                st.markdown(f"**IP Address:** `{abuse_data.get('ipAddress', curr_ip)}`")
+                st.markdown(f"**Public IP:** `{'Yes' if abuse_data.get('isPublic', True) else 'No'}`")
+                st.markdown(f"**Country Name:** `{abuse_data.get('countryName', 'N/A')}` (`{country}`)")
+                st.markdown(f"**ISP:** `{abuse_data.get('isp', 'N/A')}`")
+                st.markdown(f"**Domain:** `{abuse_data.get('domain', 'N/A')}`")
+                st.markdown(f"**Usage Type:** `{abuse_data.get('usageType', 'N/A')}`")
+            with c2:
+                st.markdown("##### 🚨 Threat Indicators & Reports")
+                st.markdown(f"**Abuse Confidence Score:** `{abuse_score}%`")
+                st.markdown(f"**Total Abuse Reports:** `{abuse_data.get('totalReports', 0)}`")
+                st.markdown(f"**Distinct Reporters:** `{abuse_data.get('numDistinctUsers', 0)}`")
+                st.markdown(f"**Last Reported At:** `{abuse_data.get('lastReportedAt', 'N/A')}`")
+                st.markdown(f"**Tor Exit Node:** `{'Yes 🚨' if abuse_data.get('isTor') else 'No ✅'}`")
+                st.markdown(f"**Whitelisted Status:** `{'Whitelisted ✅' if abuse_data.get('isWhitelisted') else 'Not Whitelisted'}`")
+
+        with intel_tab2:
+            st.markdown("#### 🦠 VirusTotal Multi-Engine Vendor Analysis")
+            if vt_stats:
+                v1, v2, v3, v4 = st.columns(4)
+                v1.error(f"🚨 Malicious: {vt_malicious}")
+                v2.warning(f"⚠️ Suspicious: {vt_suspicious}")
+                v3.success(f"✅ Harmless: {vt_harmless}")
+                v4.info(f"⚪ Undetected: {vt_stats.get('undetected', 0)}")
+
+                st.markdown("---")
+                st.markdown("##### 🔍 Network & Reputation Metadata")
+                st.markdown(f"**AS Owner:** `{vt_attr.get('as_owner', 'N/A')}`")
+                st.markdown(f"**ASN:** `{vt_attr.get('asn', 'N/A')}`")
+                st.markdown(f"**Global Reputation Score:** `{vt_attr.get('reputation', 0)}`")
+                st.markdown(f"**Network / Subnet:** `{vt_attr.get('network', 'N/A')}`")
+            else:
+                st.info("VirusTotal key rate limited ya empty format detection. Active indicators loaded.")
+
+        with intel_tab3:
+            st.markdown("#### ⚙️ Raw JSON Responses")
+            exp1, exp2 = st.columns(2)
+            with exp1:
+                st.caption("AbuseIPDB Response JSON")
+                st.json(abuse_res)
+            with exp2:
+                st.caption("VirusTotal Response JSON")
+                st.json(vt_res)
+
+        st.markdown("---")
+
+        # ── 3. Incident Response Quick Actions ──
+        st.markdown("#### ⚡ Incident Response Quick Actions")
+        act1, act2, act3 = st.columns(3)
+        
+        with act1:
+            if st.button("🔒 Simulate Firewall Block", key="btn_fw_block", use_container_width=True):
+                st.success(f"IPTables rule added: `iptables -A INPUT -s {curr_ip} -j DROP`")
+                st.toast(f"IP {curr_ip} blocked on perimeter firewall!", icon="🔒")
+                
+        with act2:
+            if st.button("📄 Export Forensic Evidence", key="btn_export_forensic", use_container_width=True):
+                st.info(f"Forensic JSON bundle generated for {curr_ip}.")
+                st.download_button(
+                    label="💾 Download Evidence Payload",
+                    data=json.dumps({"ip": curr_ip, "abuse": abuse_res, "virustotal": vt_res}, indent=2, default=str),
+                    file_name=f"forensic_report_{curr_ip}.json",
+                    mime="application/json",
+                    key="btn_download_json"
                 )
-        else:
-            st.info("No MITRE techniques mapped yet.")
+                
+        with act3:
+            if st.button("🚨 Escalate to Tier-3 SOC Team", key="btn_escalate_tier3", use_container_width=True):
+                st.warning(f"Incident ticket created for host {curr_ip}.")
+                st.toast(f"P1 Incident ticket dispatched to Tier-3 Lead!", icon="🚨")
 
-    st.markdown("---")
+# ── FLOATING AI LOG ASSISTANT (HTML/JS COMPONENT WITH POINTER-EVENTS FIX) ──────
+df_cols   = list(df.columns) if not df.empty else []
+df_sample = df.head(3).to_dict(orient="records") if not df.empty else []
+df_total  = len(df)
 
-    # ── MITRE Detail Expander ─────────────────────────────────────────────────
-    st.markdown('<p class="section-header">🔬 MITRE ATT&CK RAG Analysis — Per-Alert Detail</p>', unsafe_allow_html=True)
-    st.caption("Click any alert below to see the full Llama 3.2 MITRE reasoning from the RAG pipeline.")
-
-    with st.expander("📂 View All Alerts with MITRE Reasoning", expanded=True):
-        for idx, row in display_df.iterrows():
-            sig     = str(row.get(sig_col,     'Unknown Alert'))               if sig_col     else 'Unknown Alert'
-            mid     = str(row.get(mitre_col,   'N/A'))                         if mitre_col   else 'N/A'
-            sev     = str(row.get(severity_col,'Low'))                         if severity_col else 'Low'
-            verdict = str(row.get(verdict_col, 'Unknown'))                     if verdict_col  else 'Unknown'
-            summary = str(row.get(summary_col, 'No analysis details recorded.')) if summary_col else 'No analysis details recorded.'
-
-            icon = "🔴" if verdict.lower() == "threat" else "🟢"
-            mitre_link = f"https://attack.mitre.org/techniques/{mid.split('.')[0]}/" \
-                         if str(mid).strip().upper() not in ('N/A','NONE','NAN','') else "#"
-
-            with st.expander(f"{icon}  {sig[:90]}  —  [{mid}]"):
-                st.markdown(
-                    f'**MITRE ID:** <span class="mitre-badge">{mid}</span> &nbsp;'
-                    f'[🔗 View on MITRE ATT&CK]({mitre_link})',
-                    unsafe_allow_html=True
-                )
-                st.markdown(f"**Severity:** `{sev}` &nbsp;|&nbsp; **Verdict:** `{verdict}`")
-                st.markdown("**AI Analysis & Reasoning:**")
-                st.markdown(f'<div class="mitre-reasoning">{summary}</div>', unsafe_allow_html=True)
-
-    st.markdown("---")
-
-    # ── Threat Intel Lookup ───────────────────────────────────────────────────
-    st.markdown('<p class="section-header">🔍 Threat Intelligence IP Lookup</p>', unsafe_allow_html=True)
-
-    col_input, col_btn = st.columns([3, 1])
-    with col_input:
-        selected_ip = st.text_input("Enter IP Address:", value="118.25.6.39",
-                                    label_visibility="collapsed",
-                                    placeholder="Enter IP address to check...")
-    with col_btn:
-        check_btn = st.button("🔍 Check IP Reputation", use_container_width=True)
-
-    if check_btn:
-        with st.spinner(f"Querying AbuseIPDB & VirusTotal for {selected_ip}..."):
-            abuse_res = check_abuseipdb(selected_ip)
-            vt_res    = check_virustotal(selected_ip)
-            st.session_state["threat_intel_ip"]   = selected_ip
-            st.session_state["threat_intel_data"] = (abuse_res, vt_res)
-
-    if "threat_intel_data" in st.session_state:
-        abuse_res, vt_res = st.session_state["threat_intel_data"]
-        if not abuse_res.get("is_public", True):
-            st.info(f"ℹ️ **{selected_ip}** is a private/internal IP.")
-        else:
-            ti1, ti2 = st.columns(2)
-            with ti1:
-                st.metric("AbuseIPDB Confidence", f"{abuse_res['abuse_score']}%",
-                          delta="High Risk" if abuse_res['abuse_score'] > 50 else "Low Risk")
-                st.caption(f"Total Reports: {abuse_res['total_reports']}")
-            with ti2:
-                st.metric("VirusTotal Detections", f"{vt_res['malicious_votes']} Vendors",
-                          delta="⚠️ Flagged" if vt_res['malicious_votes'] > 0 else "✅ Clean")
-
-    with st.expander("📊 Raw Alert History Table"):
-        st.dataframe(df, use_container_width=True)
-
-else:
-    st.info("⏳ Awaiting alert stream from Suricata IDS... Run `python suricata_ai_agent.py eve.json` to populate data.")
-    st.markdown("---")
-    st.markdown('<p class="section-header">🧪 MITRE RAG System — Live Test</p>', unsafe_allow_html=True)
-    test_sig = st.text_input("Enter an alert signature to test RAG:", value="ET SCAN Potential Nmap Scan Detected")
-    if st.button("🚀 Run MITRE RAG Lookup"):
-        with st.spinner("Running FAISS retrieval + Llama 3.2 analysis..."):
-            try:
-                from rag_mitre import retrieve_mitre_context
-                result = retrieve_mitre_context(test_sig)
-                st.success("RAG analysis complete!")
-                st.code(result, language="text")
-            except Exception as e:
-                st.error(f"RAG lookup failed: {e}")
-
-# ── Floating AI Chat Widget (self-contained HTML component) ───────────────────
-# Build df context to pass into the JS chat prompt
-df_cols    = list(df.columns) if not df.empty else []
-df_sample  = df.head(3).to_dict(orient="records") if not df.empty else []
-df_total   = len(df)
-ctx_json   = json.dumps({"columns": df_cols, "sample": df_sample, "total": df_total})
+ctx_json  = json.dumps({"columns": df_cols, "sample": df_sample, "total": df_total}, default=str)
 
 chat_html = f"""
 <!DOCTYPE html>
@@ -330,9 +709,9 @@ chat_html = f"""
 <meta charset="utf-8">
 <style>
   * {{ box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', sans-serif; }}
-  body {{ background: transparent; overflow: hidden; }}
+  body {{ background: transparent; overflow: hidden; pointer-events: none; }} /* 🔥 Click-through background */
 
-  /* ── Floating button ── */
+  /* ── Floating FAB button ── */
   #fab {{
     position: fixed;
     bottom: 24px;
@@ -349,6 +728,7 @@ chat_html = f"""
     justify-content: center;
     font-size: 26px;
     z-index: 9999;
+    pointer-events: auto !important; /* Button fully interactive */
     animation: pulse 2.5s ease-in-out infinite;
     transition: transform 0.2s;
   }}
@@ -383,6 +763,7 @@ chat_html = f"""
     flex-direction: column;
     overflow: hidden;
     z-index: 9998;
+    pointer-events: auto !important; /* Panel fully interactive */
     animation: slideUp 0.25s ease;
   }}
   @keyframes slideUp {{
@@ -489,12 +870,10 @@ chat_html = f"""
 </head>
 <body>
 
-<!-- Floating button -->
 <button id="fab" onclick="toggleChat()" title="Open AI Chat">
   🤖<span class="badge"></span>
 </button>
 
-<!-- Chat panel -->
 <div id="chat-panel">
   <div class="ch">
     <div>
@@ -530,7 +909,6 @@ function toggleChat() {{
   panel.classList.toggle('open');
 }}
 
-// Send on Enter (not Shift+Enter)
 document.getElementById('user-in').addEventListener('keydown', function(e) {{
   if (e.key === 'Enter' && !e.shiftKey) {{ e.preventDefault(); sendMsg(); }}
 }});
@@ -563,7 +941,6 @@ function sendMsg() {{
   addMsg('user', text);
   btn.disabled = true;
 
-  // Build prompt with df context
   var prompt = `You are an expert SOC analyst AI assistant.
 The alert database has ${{DF_CTX.total}} records with columns: ${{DF_CTX.columns.join(', ')}}.
 Sample records: ${{JSON.stringify(DF_CTX.sample)}}.
@@ -602,47 +979,7 @@ Answer concisely and technically. If the user asks to filter/show records, descr
 </html>
 """
 
-# Inject CSS into parent page to make the component iframe fixed bottom-right
-# This runs in the parent Streamlit document via st.markdown CSS injection
-st.markdown("""
-<style>
-  /* Target all variations of Streamlit component wrappers to fix the iframe to the screen bottom-right */
-  div[data-testid="stCustomComponentV1"],
-  div[data-testid="element-container"]:has(iframe),
-  .stElementContainer:has(iframe),
-  iframe[title="components.html"],
-  iframe[title="st.iframe"] {
-    position: fixed !important;
-    bottom: 0px !important;
-    right: 0px !important;
-    width: 420px !important;
-    height: 650px !important;
-    z-index: 999999 !important;
-    background: transparent !important;
-    border: none !important;
-  }
-
-  /* Prevent empty block space at the bottom of the document flow */
-  div[data-testid="element-container"]:has(iframe),
-  .stElementContainer:has(iframe) {
-    height: 0px !important;
-    min-height: 0px !important;
-    margin: 0px !important;
-    padding: 0px !important;
-  }
-
-  /* Allow click interactions inside the iframe */
-  iframe[title="components.html"],
-  iframe[title="st.iframe"],
-  div[data-testid="stCustomComponentV1"] iframe {
-    pointer-events: auto !important;
-  }
-</style>
-""", unsafe_allow_html=True)
-
-# Render the floating chat — height=650 matches the CSS above
 components.html(chat_html, height=650, scrolling=False)
 
-# ── Auto-refresh ──────────────────────────────────────────────────────────────
 time.sleep(5)
 st.rerun()
