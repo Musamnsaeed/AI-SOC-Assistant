@@ -584,11 +584,13 @@ elif selected_tab == "🔍 Threat Intel Workbench":
             if st.button("🚨 Escalate to Tier-3 SOC Team", key="btn_escalate_tier3", use_container_width=True):
                 st.warning(f"Incident ticket created for host {curr_ip}.")
                 st.toast(f"P1 Incident ticket dispatched to Tier-3 Lead!", icon="🚨")
-# ── FLOATING AI LOG ASSISTANT (FIXED CSS & JS) ──────────────
+
+# ── FLOATING AI LOG ASSISTANT (HTML/JS COMPONENT WITH FAB BUTTON) ──────────────
 df_cols   = list(df.columns) if not df.empty else []
 df_sample = df.head(3).to_dict(orient="records") if not df.empty else []
 df_total  = len(df)
 
+# 🔥 FIX: Added 'default=str' to handle Pandas Timestamps without JSON TypeError
 ctx_json  = json.dumps({"columns": df_cols, "sample": df_sample, "total": df_total}, default=str)
 
 chat_html = f"""
@@ -598,72 +600,195 @@ chat_html = f"""
 <meta charset="utf-8">
 <style>
   * {{ box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', sans-serif; }}
-  body {{ background: transparent; overflow: hidden; height: 100vh; width: 100vw; }}
+  body {{ background: transparent; overflow: hidden; }}
 
+  /* ── Floating FAB button ── */
   #fab {{
     position: fixed;
-    bottom: 10px;
-    right: 10px;
-    width: 55px;
-    height: 55px;
+    bottom: 24px;
+    right: 24px;
+    width: 60px;
+    height: 60px;
     border-radius: 50%;
     background: linear-gradient(135deg, #1d4ed8, #7c3aed);
-    box-shadow: 0 4px 16px rgba(0,0,0,0.5);
-    border: 2px solid #38bdf8;
+    box-shadow: 0 4px 24px rgba(124,58,237,0.6);
+    border: none;
     cursor: pointer;
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 24px;
-    z-index: 999999;
+    font-size: 26px;
+    z-index: 9999;
+    animation: pulse 2.5s ease-in-out infinite;
+    transition: transform 0.2s;
   }}
+  #fab:hover {{ transform: scale(1.1); }}
+  #fab .badge {{
+    position: absolute;
+    top: 3px; right: 3px;
+    width: 13px; height: 13px;
+    background: #22c55e;
+    border-radius: 50%;
+    border: 2px solid #0d1117;
+    animation: blink 1.5s ease-in-out infinite;
+  }}
+  @keyframes pulse {{
+    0%,100% {{ box-shadow: 0 4px 24px rgba(124,58,237,0.6); }}
+    50%      {{ box-shadow: 0 4px 36px rgba(124,58,237,0.9); }}
+  }}
+  @keyframes blink {{ 0%,100% {{ opacity:1; }} 50% {{ opacity:0.2; }} }}
 
+  /* ── Chat panel ── */
   #chat-panel {{
     display: none;
     position: fixed;
-    bottom: 75px;
-    right: 10px;
+    bottom: 96px;
+    right: 24px;
     width: 360px;
-    height: 480px;
-    background: #0d1117;
+    max-height: 520px;
+    background: linear-gradient(180deg, #0d1117 0%, #161b22 100%);
     border: 1px solid #30363d;
-    border-radius: 12px;
-    box-shadow: 0 8px 32px rgba(0,0,0,0.8);
+    border-radius: 16px;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.6);
     flex-direction: column;
     overflow: hidden;
-    z-index: 999998;
+    z-index: 9998;
+    animation: slideUp 0.25s ease;
+  }}
+  @keyframes slideUp {{
+    from {{ opacity:0; transform: translateY(20px); }}
+    to   {{ opacity:1; transform: translateY(0); }}
   }}
   #chat-panel.open {{ display: flex; }}
 
-  .ch {{ background: #161b22; padding: 12px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #30363d; }}
-  .ch-title {{ color: #f8fafc; font-weight: bold; font-size: 0.9rem; }}
-  .ch-close {{ background: transparent; border: none; color: #94a3b8; cursor: pointer; font-size: 16px; }}
+  /* Header */
+  .ch {{
+    background: linear-gradient(135deg, #1d4ed8, #7c3aed);
+    padding: 14px 16px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-shrink: 0;
+  }}
+  .ch-title {{ color:#fff; font-weight:700; font-size:0.95rem; }}
+  .ch-sub   {{ color:rgba(255,255,255,0.7); font-size:0.72rem; margin-top:2px; }}
+  .ch-close {{
+    background: rgba(255,255,255,0.15);
+    border: none; color:#fff; cursor:pointer;
+    width:28px; height:28px; border-radius:50%;
+    font-size:16px; display:flex; align-items:center; justify-content:center;
+  }}
+  .ch-close:hover {{ background:rgba(255,255,255,0.3); }}
 
-  #msgs {{ flex: 1; padding: 10px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; font-size: 0.8rem; color: #e2e8f0; }}
-  .bubble {{ padding: 8px 12px; border-radius: 8px; max-width: 85%; }}
-  .bubble.user {{ background: #1d4ed8; align-self: flex-end; color: white; }}
-  .bubble.ai {{ background: #1e293b; align-self: flex-start; border: 1px solid #334155; }}
+  /* Messages area */
+  #msgs {{
+    flex: 1;
+    overflow-y: auto;
+    padding: 12px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    scroll-behavior: smooth;
+  }}
+  #msgs::-webkit-scrollbar {{ width:4px; }}
+  #msgs::-webkit-scrollbar-track {{ background:#0d1117; }}
+  #msgs::-webkit-scrollbar-thumb {{ background:#30363d; border-radius:2px; }}
 
-  .input-row {{ padding: 8px; background: #161b22; display: flex; gap: 6px; border-top: 1px solid #30363d; }}
-  #user-in {{ flex: 1; background: #0d1117; border: 1px solid #30363d; color: white; padding: 6px; border-radius: 6px; outline: none; }}
-  #send-btn {{ background: #2563eb; color: white; border: none; padding: 6px 12px; border-radius: 6px; cursor: pointer; }}
+  .empty-state {{
+    text-align:center; padding:24px 10px; color:#4a5568;
+    font-size:0.8rem; line-height:1.7;
+  }}
+  .empty-state .es-icon {{ font-size:2.2rem; margin-bottom:8px; }}
+  .empty-state i {{ color:#374151; }}
+
+  .bubble {{ max-width:85%; padding:9px 13px; border-radius:14px; font-size:0.83rem; line-height:1.5; word-wrap:break-word; }}
+  .bubble.user {{ align-self:flex-end; background:linear-gradient(135deg,#1d4ed8,#2563eb); color:#fff; border-radius:14px 14px 4px 14px; }}
+  .bubble.ai   {{ align-self:flex-start; background:#1c2333; color:#e6edf3; border:1px solid #30363d; border-radius:14px 14px 14px 4px; }}
+  .bubble.typing {{ color:#6e7681; font-style:italic; }}
+  .lbl {{ font-size:0.68rem; color:#6e7681; margin-bottom:2px; }}
+  .lbl.user {{ align-self:flex-end; }}
+  .lbl.ai   {{ align-self:flex-start; }}
+
+  /* Input row */
+  .input-row {{
+    padding: 10px 12px;
+    border-top: 1px solid #21262d;
+    display: flex;
+    gap: 8px;
+    flex-shrink: 0;
+    background: #0d1117;
+  }}
+  #user-in {{
+    flex:1;
+    background: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 10px;
+    color: #e6edf3;
+    font-size: 0.82rem;
+    padding: 8px 12px;
+    resize: none;
+    outline: none;
+    font-family: inherit;
+  }}
+  #user-in:focus {{ border-color: #1d4ed8; }}
+  #user-in::placeholder {{ color:#4a5568; }}
+  #send-btn {{
+    background: linear-gradient(135deg, #1d4ed8, #7c3aed);
+    border: none;
+    border-radius: 10px;
+    color: #fff;
+    padding: 8px 14px;
+    cursor: pointer;
+    font-size:0.82rem;
+    font-weight:600;
+    white-space: nowrap;
+    transition: opacity 0.2s;
+  }}
+  #send-btn:hover {{ opacity:0.85; }}
+  #send-btn:disabled {{ opacity:0.4; cursor:not-allowed; }}
+
+  .status-bar {{
+    padding: 4px 14px 8px;
+    font-size: 0.7rem;
+    color: #4a5568;
+    background: #0d1117;
+    flex-shrink: 0;
+  }}
+  .dot-online {{ display:inline-block; width:6px; height:6px; background:#22c55e; border-radius:50%; margin-right:4px; vertical-align:middle; }}
 </style>
 </head>
 <body>
 
-<button id="fab" onclick="toggleChat()">🤖</button>
+<!-- Floating FAB Button -->
+<button id="fab" onclick="toggleChat()" title="Open AI Chat">
+  🤖<span class="badge"></span>
+</button>
 
+<!-- Chat Panel -->
 <div id="chat-panel">
   <div class="ch">
-    <div class="ch-title">🤖 AI Agent Assistant</div>
+    <div>
+      <div class="ch-title">🤖 AI Log Assistant</div>
+      <div class="ch-sub">Llama 3.2 · {df_total} alerts loaded</div>
+    </div>
     <button class="ch-close" onclick="toggleChat()">✕</button>
   </div>
+
   <div id="msgs">
-    <div class="bubble ai">Hello! Ask me anything about your SOC logs.</div>
+    <div class="empty-state" id="empty">
+      <div class="es-icon">💬</div>
+      Ask me anything about your<br>security alerts in plain English.<br><br>
+      <i>e.g. "Show all critical threats"<br>"SSH brute force attempts"</i>
+    </div>
   </div>
+
+  <div class="status-bar">
+    <span class="dot-online"></span>Ollama connected · {df_total} records ready
+  </div>
+
   <div class="input-row">
-    <input type="text" id="user-in" placeholder="Ask AI..." onkeypress="if(event.key==='Enter') sendMsg()">
-    <button id="send-btn" onclick="sendMsg()">Send</button>
+    <textarea id="user-in" rows="2" placeholder="Ask about your alerts…"></textarea>
+    <button id="send-btn" onclick="sendMsg()">Send ➤</button>
   </div>
 </div>
 
@@ -675,43 +800,75 @@ function toggleChat() {{
   panel.classList.toggle('open');
 }}
 
+document.getElementById('user-in').addEventListener('keydown', function(e) {{
+  if (e.key === 'Enter' && !e.shiftKey) {{ e.preventDefault(); sendMsg(); }}
+}});
+
+function addMsg(role, text) {{
+  var msgs = document.getElementById('msgs');
+  var empty = document.getElementById('empty');
+  if (empty) empty.remove();
+
+  var lbl = document.createElement('div');
+  lbl.className = 'lbl ' + role;
+  lbl.textContent = role === 'user' ? 'You' : '🤖 AI';
+  msgs.appendChild(lbl);
+
+  var bub = document.createElement('div');
+  bub.className = 'bubble ' + role;
+  bub.textContent = text;
+  msgs.appendChild(bub);
+  msgs.scrollTop = msgs.scrollHeight;
+  return bub;
+}}
+
 function sendMsg() {{
   var inp = document.getElementById('user-in');
+  var btn = document.getElementById('send-btn');
   var text = inp.value.trim();
   if (!text) return;
 
-  var msgs = document.getElementById('msgs');
-  msgs.innerHTML += '<div class="bubble user">' + text + '</div>';
   inp.value = '';
+  addMsg('user', text);
+  btn.disabled = true;
 
-  var typing = document.createElement('div');
-  typing.className = 'bubble ai';
-  typing.innerText = 'Thinking...';
-  msgs.appendChild(typing);
-  msgs.scrollTop = msgs.scrollHeight;
+  var prompt = `You are an expert SOC analyst AI assistant.
+The alert database has ${{DF_CTX.total}} records with columns: ${{DF_CTX.columns.join(', ')}}.
+Sample records: ${{JSON.stringify(DF_CTX.sample)}}.
+
+User question: "${{text}}"
+
+Answer concisely and technically. If the user asks to filter/show records, describe what the filter would return based on the sample. Keep answer under 150 words.`;
+
+  var typing = addMsg('ai', '⌛ Thinking…');
+  typing.classList.add('typing');
 
   fetch('http://localhost:11434/api/generate', {{
     method: 'POST',
     headers: {{'Content-Type': 'application/json'}},
     body: JSON.stringify({{
       model: 'llama3.2',
-      prompt: "Context: " + JSON.stringify(DF_CTX) + "\\nUser Question: " + text,
+      prompt: prompt,
       stream: false
     }})
   }})
-  .then(r => r.json())
-  .then(data => {{
-    typing.innerText = data.response || 'No response';
-    msgs.scrollTop = msgs.scrollHeight;
+  .then(function(r) {{ return r.json(); }})
+  .then(function(data) {{
+    typing.textContent = data.response || 'No response received.';
+    typing.classList.remove('typing');
+    btn.disabled = false;
+    document.getElementById('msgs').scrollTop = 999999;
   }})
-  .catch(err => {{
-    typing.innerText = '⚠️ Error connecting to Ollama agent.';
+  .catch(function(err) {{
+    typing.textContent = '⚠️ Could not reach Ollama. Make sure it is running at localhost:11434.';
+    typing.classList.remove('typing');
+    btn.disabled = false;
   }});
 }}
 </script>
 </body>
 </html>
 """
+# Render the floating HTML component
+components.html(chat_html, height=650, scrolling=False)
 
-# HTML component rendering inside bounded dimensions
-components.html(chat_html, height=600, scrolling=False)

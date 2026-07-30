@@ -1,1 +1,4 @@
-![AI SOC Analyst Dashboard Architecture](./architecture_banner.png)
+
+## System Architecture & Flow
+
+![SOC Dashboard Architecture](./assets/system_flow.png)
