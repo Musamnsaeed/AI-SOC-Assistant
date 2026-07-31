@@ -97,16 +97,14 @@ Bash
 docker-compose up --build -d
 ```
 
-
 Environment Variables Setup (Optional CTI Keys) For live IP lookup on AbuseIPDB & VirusTotal, create a .env file in the root folder:
 
 Code snippet
 
--->ABUSEIPDB_API_KEY="your_abuseipdb_api_key" 
+-->ABUSEIPDB_API_KEY="your_abuseipdb_api_key" //thread_intel.py
 
--->VIRUSTOTAL_API_KEY="your_virustotal_api_key" 
+-->VIRUSTOTAL_API_KEY="your_virustotal_api_key" //thread_intel.py
 
 * Features Hybrid Processing Pipeline: Fast-path rule filtering paired with deep-pass local LLM triage.
 * Local RAG Integration: FAISS Vector Index mapping events to 700+ MITRE ATT&CK techniques.
-
 * Interactive UI: Streamlit dashboards featuring Plotly analytics, live alert feeds, and CTI workbenches.
