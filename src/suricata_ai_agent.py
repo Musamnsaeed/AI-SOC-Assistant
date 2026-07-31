@@ -7,14 +7,25 @@ import pandas as pd
 from threat_intel import check_abuseipdb, check_virustotal
 from rag_mitre import retrieve_mitre_context
 
-# Target the installed Suricata log path on Windows if it exists, otherwise fall back to local eve.json
+# Target the installed Suricata log path on Windows if it exists, otherwise fall back to data/eve.json
 DEFAULT_SURI_PATH = r"C:\Program Files\Suricata\log\eve.json"
 if os.path.exists(DEFAULT_SURI_PATH):
     EVE_JSON_PATH = DEFAULT_SURI_PATH
 else:
-    EVE_JSON_PATH = "eve.json"
+    if os.path.exists("data"):
+        EVE_JSON_PATH = "data/eve.json"
+    elif os.path.exists(os.path.join("..", "data")):
+        EVE_JSON_PATH = os.path.join("..", "data", "eve.json")
+    else:
+        EVE_JSON_PATH = "data/eve.json"
 
-CSV_DATABASE = "alert_history.csv"
+if os.path.exists("data"):
+    CSV_DATABASE = "data/alert_history.csv"
+elif os.path.exists(os.path.join("..", "data")):
+    CSV_DATABASE = os.path.join("..", "data", "alert_history.csv")
+else:
+    CSV_DATABASE = "data/alert_history.csv"
+
 OLLAMA_URL = "http://localhost:11434/api/generate"
 
 def query_logs_with_llm(user_query: str, df: pd.DataFrame):

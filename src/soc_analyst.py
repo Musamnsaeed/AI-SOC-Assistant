@@ -35,8 +35,12 @@ def analyze_log_with_local_llm(log_data):
 
 # Log file read karke analyze karna
 if __name__ == "__main__":
+    import os
     print("Reading sample logs...")
-    with open("sample_logs.txt", "r") as file:
+    sample_path = "data/sample_logs.txt"
+    if not os.path.exists("data") and os.path.exists(os.path.join("..", "data")):
+        sample_path = os.path.join("..", "data", "sample_logs.txt")
+    with open(sample_path, "r") as file:
         logs = file.readlines()
     
     print("\n--- Starting AI SOC Analysis --- \n")

@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import time
 from datetime import datetime
@@ -7,8 +8,14 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 import streamlit.components.v1 as components
-from suricata_ai_agent import query_logs_with_llm
-from threat_intel import check_abuseipdb, check_virustotal
+
+# Ensure the 'src' directory is in the import search path
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'src'))
+
+from src.suricata_ai_agent import query_logs_with_llm
+from src.threat_intel import check_abuseipdb, check_virustotal
+from src import rag_mitre
+from src.soc_pipeline_v2 import SOCPipeline
 
 # ── Page Configuration ────────────────────────────────────────────────────────
 st.set_page_config(
@@ -19,7 +26,7 @@ st.set_page_config(
 )
 
 # ── Data Ingestion & Preprocessing ────────────────────────────────────────────
-csv_file = "alert_history.csv"
+csv_file = "data/alert_history.csv"
 if os.path.exists(csv_file) and os.path.getsize(csv_file) > 0:
     try:
         df = pd.read_csv(csv_file, on_bad_lines='skip')
@@ -43,14 +50,32 @@ vt_col       = col_map.get('vt_malicious')
 
 # ── PASS 1: FAST RULE-BASED HYBRID FILTERING ────────────────────────────────
 if not df.empty:
-    if severity_col:
-        if pd.api.types.is_numeric_dtype(df[severity_col]):
-            sev_map = {1: 'Critical', 2: 'Medium', 3: 'Low'}
-            df['severity_clean'] = df[severity_col].map(sev_map).fillna('Low')
+    # Rule-based fallback mapping function
+    def map_suricata_severity(row):
+        # 1. Pehle check karein agar AI ne severity di hai
+        ai_sev = row.get('ai_severity', row.get('Severity', row.get('severity')))
+        if pd.notna(ai_sev) and str(ai_sev).strip().capitalize() not in ('Unknown', 'N/a', ''):
+            return str(ai_sev).strip().capitalize()
+        
+        # 2. Agar AI se pass nahi hua, toh Suricata alert.severity number check karein
+        sev_num = row.get('alert.severity', row.get('alert_severity', row.get('severity', 3)))
+        
+        try:
+            sev_num = int(float(sev_num))
+        except (ValueError, TypeError):
+            if isinstance(sev_num, str) and sev_num.strip().capitalize() in ('Critical', 'High', 'Medium', 'Low'):
+                return sev_num.strip().capitalize()
+            sev_num = 3
+            
+        if sev_num == 1:
+            return 'High'
+        elif sev_num == 2:
+            return 'Medium'
         else:
-            df['severity_clean'] = df[severity_col].astype(str).str.capitalize()
-    else:
-        df['severity_clean'] = 'Low'
+            return 'Low'  # 'Unknown' ki jagah default 'Low' assign hoga
+
+    # Apply mapping on DataFrame
+    df['severity_clean'] = df.apply(map_suricata_severity, axis=1)
 
     if 'mitre_id' in col_map:
         mitre_col = col_map['mitre_id']

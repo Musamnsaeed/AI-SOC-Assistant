@@ -16,7 +16,12 @@ import sys
 import os
 from datetime import datetime, timezone
 
-EVE_FILE = "eve.json"
+if os.path.exists("data"):
+    EVE_FILE = "data/eve.json"
+elif os.path.exists(os.path.join("..", "data")):
+    EVE_FILE = os.path.join("..", "data", "eve.json")
+else:
+    EVE_FILE = "data/eve.json"
 
 REALWORLD_ALERTS = [
     {
